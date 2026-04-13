@@ -1,1 +1,3 @@
-playwright>=1.44.0
+# playwright 1.56.x uses chromium-1194 (pre-installed on many systems)
+# If you have a newer chromium, try: pip install playwright && playwright install chromium
+playwright==1.56.0

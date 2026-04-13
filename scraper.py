@@ -8,9 +8,10 @@ Extracts player → decks mapping by:
 4. Collecting deck data returned for each player
 
 Usage:
-    python scraper.py                   # scrape all players, save to output.json + output.csv
-    python scraper.py --player "Name"   # scrape a single player
-    python scraper.py --debug           # show browser window + save screenshots
+    python scraper.py                      # scrape all players → output.json + output.csv
+    python scraper.py --player "Name"      # scrape a single player
+    python scraper.py --inspect-network    # dump ALL network requests to network_dump.json
+    python scraper.py --debug              # verbose + save page text
 """
 
 import asyncio
@@ -22,7 +23,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from playwright.async_api import async_playwright, Page, BrowserContext, Response
+from playwright.async_api import async_playwright, Page, BrowserContext, Response, Request
 
 DASHBOARD_URL = "https://datalens.yandex/6dr39r9a9l9mt"
 
@@ -39,60 +40,47 @@ SEL_SELECT_OPTION = (
     "[class*='g-select-list__option'],"
     "[role='option']"
 )
-SEL_TABLE_CELL = (
-    "td,"
-    "[class*='chartkit-table'] td,"
-    "[class*='Table__cell']"
-)
 
 
-# ─── API interception helpers ────────────────────────────────────────────────
+# ─── Network capture helpers ─────────────────────────────────────────────────
 
-def is_chart_response(url: str) -> bool:
+def is_chart_api(url: str) -> bool:
     """Return True if the URL looks like a DataLens chart-data endpoint."""
-    patterns = [
-        r"/api/run",
-        r"charts\.yandex",
-        r"datalens\.yandex.*/(run|data|chart)",
-        r"/api/embeds/",
-    ]
-    return any(re.search(p, url) for p in patterns)
+    return bool(re.search(
+        r"(/api/run|/api/embeds|charts\.yandex|datalens\.yandex.*(run|data|chart))",
+        url,
+    ))
 
 
 def extract_rows_from_body(body: Any) -> list[dict]:
     """
-    Attempt to pull tabular rows out of a DataLens chart API response.
-    DataLens returns data in a variety of shapes; we try the common ones.
+    Pull tabular rows out of a DataLens chart API response.
+    DataLens returns data in several shapes; we try each.
     """
     rows: list[dict] = []
-
     if not isinstance(body, dict):
         return rows
 
-    # Shape 1: {"data": {"rows": [[val, ...]], "columns": [{"name": ...}]}}
+    # Shape 1: {"data": {"rows": [[...]], "columns": [{"name": ...}, ...]}}
     data = body.get("data", {})
     if isinstance(data, dict):
         columns = data.get("columns", [])
-        col_names = [c.get("name", c) if isinstance(c, dict) else str(c) for c in columns]
+        col_names = [c.get("name", str(i)) if isinstance(c, dict) else str(c)
+                     for i, c in enumerate(columns)]
         for row in data.get("rows", []):
-            if col_names:
-                rows.append(dict(zip(col_names, row)))
-            else:
-                rows.append({"value": row})
+            rows.append(dict(zip(col_names, row)) if col_names else {"value": row})
 
-    # Shape 2: {"result": {"data": {"Data": [[...]], "Type": [...]}}}
+    # Shape 2: {"result": {"data": {"Data": [[...]], ...}}}
     result = body.get("result", {})
     if isinstance(result, dict):
         inner = result.get("data", {})
         if isinstance(inner, dict):
-            data_rows = inner.get("Data", [])
-            types = inner.get("Type", [])
-            for row in data_rows:
+            for row in inner.get("Data", []):
                 rows.append(dict(enumerate(row)))
 
     # Shape 3: flat list at top level
     if not rows and isinstance(body, list):
-        rows = body
+        rows = list(body)
 
     return rows
 
@@ -100,123 +88,135 @@ def extract_rows_from_body(body: Any) -> list[dict]:
 # ─── Core scraper ────────────────────────────────────────────────────────────
 
 class DataLensScraper:
-    def __init__(self, headless: bool = True, debug: bool = False):
+    def __init__(self, headless: bool = True, debug: bool = False,
+                 inspect_network: bool = False):
         self.headless = headless
         self.debug = debug
-        self._captured: list[dict] = []   # raw API payloads captured during a player selection
+        self.inspect_network = inspect_network
+
+        self._chart_responses: list[dict] = []   # chart API captures (current player)
+        self._all_traffic: list[dict] = []        # full traffic dump (--inspect-network)
+
+    # ── response listener ────────────────────────────────────────────────────
 
     async def _on_response(self, response: Response) -> None:
-        if not is_chart_response(response.url):
+        url = response.url
+        status = response.status
+        content_type = response.headers.get("content-type", "")
+
+        if "json" not in content_type:
+            if self.inspect_network:
+                self._all_traffic.append({
+                    "url": url,
+                    "status": status,
+                    "content_type": content_type,
+                    "body": None,
+                })
             return
+
         try:
             body = await response.json()
-            self._captured.append({"url": response.url, "body": body})
-            if self.debug:
-                print(f"  [API] {response.url}")
         except Exception:
-            pass  # binary / non-JSON responses
+            body = None
+
+        if self.inspect_network:
+            self._all_traffic.append({
+                "url": url,
+                "status": status,
+                "content_type": content_type,
+                "body": body,
+            })
+
+        if is_chart_api(url) and body is not None:
+            self._chart_responses.append({"url": url, "body": body})
+            if self.debug:
+                print(f"  [chart API] {url}")
+
+    # ── find player options ──────────────────────────────────────────────────
 
     async def _get_player_options(self, page: Page) -> list[str]:
-        """
-        Find the selector widget, open it, and return all player option labels.
-        Tries several strategies in order.
-        """
-        # Strategy A: native <select> element
-        selects = await page.query_selector_all("select")
-        for sel in selects:
+        """Find the selector widget and return all option labels."""
+
+        # Strategy A: native <select>
+        for sel in await page.query_selector_all("select"):
             options = await sel.query_selector_all("option")
-            values = [await o.inner_text() for o in options]
-            values = [v.strip() for v in values if v.strip()]
+            values = [(await o.inner_text()).strip() for o in options]
+            values = [v for v in values if v]
             if values:
-                print(f"  Found native <select> with {len(values)} options.")
+                print(f"  Selector: native <select>, {len(values)} options.")
                 return values
 
-        # Strategy B: @gravity-ui/uikit Select (renders a <button>)
+        # Strategy B: @gravity-ui/uikit Select (rendered as <button>)
         control = await page.query_selector(SEL_SELECT_CONTROL)
         if control:
             await control.click()
             await page.wait_for_timeout(800)
-
             option_els = await page.query_selector_all(SEL_SELECT_OPTION)
             if option_els:
-                names = [await el.inner_text() for el in option_els]
-                names = [n.strip() for n in names if n.strip()]
-                print(f"  Found Gravity-UI Select with {len(names)} options.")
-                # Close the popup before returning
+                names = [(await el.inner_text()).strip() for el in option_els]
+                names = [n for n in names if n]
+                print(f"  Selector: Gravity-UI Select, {len(names)} options.")
                 await page.keyboard.press("Escape")
                 return names
 
-        # Strategy C: any element with role="listbox" or role="combobox"
-        combos = await page.query_selector_all("[role='combobox'], [role='listbox']")
-        for combo in combos:
+        # Strategy C: role=combobox / listbox
+        for combo in await page.query_selector_all("[role='combobox'],[role='listbox']"):
             await combo.click()
             await page.wait_for_timeout(600)
             option_els = await page.query_selector_all("[role='option']")
             if option_els:
-                names = [await el.inner_text() for el in option_els]
-                names = [n.strip() for n in names if n.strip()]
-                print(f"  Found combobox/listbox with {len(names)} options.")
+                names = [(await el.inner_text()).strip() for el in option_els]
+                names = [n for n in names if n]
+                print(f"  Selector: ARIA combobox/listbox, {len(names)} options.")
                 await page.keyboard.press("Escape")
                 return names
 
         return []
 
-    async def _select_player(self, page: Page, player: str) -> bool:
-        """Select a specific player in the selector widget. Returns True on success."""
+    # ── select a player ──────────────────────────────────────────────────────
 
-        # Try native <select>
-        selects = await page.query_selector_all("select")
-        for sel in selects:
-            options = await sel.query_selector_all("option")
-            for opt in options:
-                text = (await opt.inner_text()).strip()
-                if text == player:
+    async def _select_player(self, page: Page, player: str) -> bool:
+        # Native <select>
+        for sel in await page.query_selector_all("select"):
+            for opt in await sel.query_selector_all("option"):
+                if (await opt.inner_text()).strip() == player:
                     await sel.select_option(label=player)
                     return True
 
-        # Try Gravity-UI Select button → click option by text
+        # Gravity-UI Select
         control = await page.query_selector(SEL_SELECT_CONTROL)
         if control:
             await control.click()
             await page.wait_for_timeout(600)
-
-            option_els = await page.query_selector_all(SEL_SELECT_OPTION)
-            for el in option_els:
-                text = (await el.inner_text()).strip()
-                if text == player:
+            for el in await page.query_selector_all(SEL_SELECT_OPTION):
+                if (await el.inner_text()).strip() == player:
                     await el.click()
                     return True
-            # No match found; close popup
             await page.keyboard.press("Escape")
 
-        # Try role=option
+        # ARIA combobox / listbox
         await page.keyboard.press("Escape")
-        combos = await page.query_selector_all("[role='combobox'], [role='listbox']")
-        for combo in combos:
+        for combo in await page.query_selector_all("[role='combobox'],[role='listbox']"):
             await combo.click()
             await page.wait_for_timeout(600)
-            option_els = await page.query_selector_all("[role='option']")
-            for el in option_els:
-                text = (await el.inner_text()).strip()
-                if text == player:
+            for el in await page.query_selector_all("[role='option']"):
+                if (await el.inner_text()).strip() == player:
                     await el.click()
                     return True
             await page.keyboard.press("Escape")
 
         return False
 
-    async def _read_table_from_dom(self, page: Page) -> list[dict]:
-        """Fallback: read visible table rows from the DOM."""
-        rows: list[dict] = []
-        tables = await page.query_selector_all("table")
-        for table in tables:
-            headers_els = await table.query_selector_all("th")
-            headers = [((await h.inner_text()).strip()) for h in headers_els]
+    # ── DOM table fallback ───────────────────────────────────────────────────
 
-            body_rows = await table.query_selector_all("tbody tr")
-            for tr in body_rows:
-                cells = await tr.query_selector_all("td")
-                values = [(await c.inner_text()).strip() for c in cells]
+    async def _read_tables_from_dom(self, page: Page) -> list[dict]:
+        rows: list[dict] = []
+        for table in await page.query_selector_all("table"):
+            headers = [(await h.inner_text()).strip()
+                       for h in await table.query_selector_all("th")]
+            for tr in await table.query_selector_all("tbody tr"):
+                values = [(await c.inner_text()).strip()
+                          for c in await tr.query_selector_all("td")]
                 if not any(values):
                     continue
                 if headers and len(headers) == len(values):
@@ -225,10 +225,18 @@ class DataLensScraper:
                     rows.append({str(i): v for i, v in enumerate(values)})
         return rows
 
+    # ── screenshot (best-effort) ─────────────────────────────────────────────
+
+    async def _screenshot(self, page: Page, path: str) -> None:
+        try:
+            await page.screenshot(path=path, timeout=10_000)
+            print(f"  Screenshot → {path}")
+        except Exception as e:
+            print(f"  Screenshot skipped ({e})")
+
+    # ── main scrape ──────────────────────────────────────────────────────────
+
     async def scrape(self, target_player: str | None = None) -> dict[str, list[dict]]:
-        """
-        Main entry point. Returns {player_name: [deck_row, ...], ...}.
-        """
         results: dict[str, list[dict]] = {}
 
         async with async_playwright() as pw:
@@ -241,84 +249,107 @@ class DataLensScraper:
             page.on("response", self._on_response)
 
             print(f"Opening {DASHBOARD_URL} …")
-            await page.goto(DASHBOARD_URL, wait_until="networkidle", timeout=60_000)
+            try:
+                # Use 'domcontentloaded' – doesn't wait for external fonts/CDN
+                await page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=60_000)
+            except Exception as e:
+                print(f"  goto() raised: {e} – continuing anyway")
+
+            # Wait for JS widgets to render
+            await page.wait_for_timeout(5_000)
 
             if self.debug:
-                await page.screenshot(path="debug_initial.png")
-                print("  Screenshot saved: debug_initial.png")
+                await self._screenshot(page, "debug_initial.png")
+                text = await page.inner_text("body")
+                Path("debug_page_text.txt").write_text(text, encoding="utf-8")
+                print("  Page text → debug_page_text.txt")
 
-            # Extra wait for lazy-loaded JS widgets
-            await page.wait_for_timeout(3_000)
+            # ── inspect-network mode ─────────────────────────────────────────
+            if self.inspect_network:
+                # Wait a bit more to catch lazy-loaded requests
+                await page.wait_for_timeout(5_000)
+                dump_path = "network_dump.json"
+                with open(dump_path, "w", encoding="utf-8") as f:
+                    json.dump(self._all_traffic, f, ensure_ascii=False, indent=2)
+                print(f"\n  Captured {len(self._all_traffic)} responses → {dump_path}")
+                json_only = [r for r in self._all_traffic if r["body"] is not None]
+                print(f"  Of which {len(json_only)} are JSON.\n")
+                print("  Top URLs (JSON responses):")
+                for r in json_only[:30]:
+                    print(f"    [{r['status']}] {r['url']}")
+                await browser.close()
+                return results
 
+            # ── normal scrape mode ───────────────────────────────────────────
             players = await self._get_player_options(page)
 
             if not players:
-                print("  WARNING: Could not find any player options in the selector.")
-                print("  Dumping page text for manual inspection …")
-                text = await page.inner_text("body")
-                Path("debug_page_text.txt").write_text(text, encoding="utf-8")
+                print("\n  WARNING: no selector options found.")
+                print("  Re-run with --inspect-network to see all API calls,")
+                print("  or with --debug to dump page text.")
                 await browser.close()
                 return results
 
             if target_player:
                 players = [p for p in players if p == target_player]
                 if not players:
-                    print(f"  Player '{target_player}' not found. Available: {players}")
+                    print(f"  Player '{target_player}' not found.")
                     await browser.close()
                     return results
 
-            print(f"Found {len(players)} player(s): {players}\n")
+            print(f"\nFound {len(players)} player(s): {players}\n")
 
             for player in players:
-                print(f"Selecting player: {player}")
-                self._captured.clear()
+                print(f"Selecting: {player}")
+                self._chart_responses.clear()
 
                 ok = await self._select_player(page, player)
                 if not ok:
-                    print(f"  Could not select '{player}', skipping.")
+                    print(f"  Could not select '{player}', skipping.\n")
                     continue
 
-                # Wait for charts to reload
-                await page.wait_for_load_state("networkidle", timeout=15_000)
-                await page.wait_for_timeout(1_500)
+                # Wait for chart widgets to refresh
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=12_000)
+                except Exception:
+                    await page.wait_for_timeout(3_000)
 
                 if self.debug:
-                    safe = player.replace(" ", "_").replace("/", "-")
-                    await page.screenshot(path=f"debug_{safe}.png")
+                    safe = re.sub(r"[^\w]", "_", player)
+                    await self._screenshot(page, f"debug_{safe}.png")
 
-                # 1) Try to get data from intercepted API responses
+                # 1) API-intercepted data
                 deck_rows: list[dict] = []
-                for capture in self._captured:
+                for capture in self._chart_responses:
                     rows = extract_rows_from_body(capture["body"])
                     if rows:
                         deck_rows.extend(rows)
                         if self.debug:
-                            print(f"  Got {len(rows)} rows from {capture['url']}")
+                            print(f"  {len(rows)} rows from {capture['url']}")
 
-                # 2) Fallback: read table DOM
+                # 2) DOM fallback
                 if not deck_rows:
-                    deck_rows = await self._read_table_from_dom(page)
+                    deck_rows = await self._read_tables_from_dom(page)
                     if deck_rows:
-                        print(f"  Got {len(deck_rows)} rows from DOM table.")
+                        print(f"  {len(deck_rows)} rows from DOM table (fallback).")
 
                 results[player] = deck_rows
-                print(f"  → {len(deck_rows)} deck row(s) collected.\n")
+                print(f"  → {len(deck_rows)} deck row(s)\n")
 
             await browser.close()
 
         return results
 
 
-# ─── Output helpers ──────────────────────────────────────────────────────────
+# ─── Output ──────────────────────────────────────────────────────────────────
 
-def save_json(results: dict[str, list[dict]], path: str = "output.json") -> None:
+def save_json(results: dict, path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     print(f"Saved JSON → {path}")
 
 
-def save_csv(results: dict[str, list[dict]], path: str = "output.csv") -> None:
-    """Flatten player→decks into a single CSV with a 'player' column."""
+def save_csv(results: dict, path: str) -> None:
     all_rows: list[dict] = []
     for player, decks in results.items():
         for deck in decks:
@@ -328,11 +359,7 @@ def save_csv(results: dict[str, list[dict]], path: str = "output.csv") -> None:
         print("No rows to write to CSV.")
         return
 
-    fieldnames = list(all_rows[0].keys())
-    # Ensure 'player' is first column
-    if "player" in fieldnames:
-        fieldnames = ["player"] + [k for k in fieldnames if k != "player"]
-
+    fieldnames = ["player"] + [k for k in all_rows[0] if k != "player"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -344,19 +371,30 @@ def save_csv(results: dict[str, list[dict]], path: str = "output.csv") -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Scrape Yandex DataLens player/deck data")
-    parser.add_argument("--player", metavar="NAME", help="Scrape only this player (default: all)")
-    parser.add_argument("--out-json", default="output.json", metavar="FILE", help="JSON output path")
-    parser.add_argument("--out-csv", default="output.csv", metavar="FILE", help="CSV output path")
-    parser.add_argument("--debug", action="store_true", help="Show browser + save screenshots")
-    parser.add_argument("--headed", action="store_true", help="Run with visible browser window")
+    parser.add_argument("--player", metavar="NAME", help="Scrape only this player")
+    parser.add_argument("--out-json", default="output.json", metavar="FILE")
+    parser.add_argument("--out-csv",  default="output.csv",  metavar="FILE")
+    parser.add_argument("--debug", action="store_true",
+                        help="Verbose output + save page text + screenshots")
+    parser.add_argument("--headed", action="store_true",
+                        help="Run with visible browser window")
+    parser.add_argument("--inspect-network", action="store_true",
+                        help="Dump all network JSON responses to network_dump.json, then exit")
     return parser.parse_args()
 
 
 async def main() -> None:
     args = parse_args()
-    scraper = DataLensScraper(headless=not args.headed, debug=args.debug)
+    scraper = DataLensScraper(
+        headless=not args.headed,
+        debug=args.debug,
+        inspect_network=args.inspect_network,
+    )
 
     results = await scraper.scrape(target_player=args.player)
+
+    if args.inspect_network:
+        return  # already printed summary
 
     if not results:
         print("No data collected.")
@@ -365,8 +403,8 @@ async def main() -> None:
     save_json(results, args.out_json)
     save_csv(results, args.out_csv)
 
-    total_decks = sum(len(v) for v in results.values())
-    print(f"\nDone. {len(results)} player(s), {total_decks} total deck row(s).")
+    total = sum(len(v) for v in results.values())
+    print(f"\nDone: {len(results)} player(s), {total} total deck row(s).")
 
 
 if __name__ == "__main__":
